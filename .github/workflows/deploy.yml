@@ -46,12 +46,12 @@ jobs:
 
           const firebaseConfig = {
             apiKey: process.env.FIREBASE_API_KEY,
-            authDomain: "quizquest-3d82a.firebaseapp.com",
-            projectId: "quizquest-3d82a",
-            storageBucket: "quizquest-3d82a.firebasestorage.app",
-            messagingSenderId: "258935637691",
-            appId: "1:258935637691:web:3e6b5af0ae7a4f022ecb9e",
-            measurementId: "G-FRCW084FTV"
+            authDomain: "shanjayaquizmanagement.firebaseapp.com",
+            projectId: "shanjayaquizmanagement",
+            storageBucket: "shanjayaquizmanagement.firebasestorage.app",
+            messagingSenderId: "948823713064",
+            appId: "1:948823713064:web:87aa0c879c2e78a19c9c1d",
+            measurementId: "G-XCL8BHFTSQ"
           };
 
           const source = `// Firebase Initialization & Configuration

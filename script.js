@@ -1513,19 +1513,36 @@ async function loadUserData(user) {
 
     currentUser = user;
 
+    // Helper: race a Firestore promise against a timeout
+    function withTimeout(promise, ms) {
+        return Promise.race([
+            promise,
+            new Promise((_, reject) =>
+                setTimeout(() => reject(new Error("timeout")), ms)
+            )
+        ]);
+    }
+
     try {
 
         const docRef = db.collection("users").doc(user.uid);
-        const docSnap = await docRef.get();
 
-        if (docSnap.exists) {
+        let docSnap;
+        try {
+            docSnap = await withTimeout(docRef.get(), 5000);
+        } catch (timeoutErr) {
+            console.warn("[QuizMaster] User doc fetch timed out — using local fallback.");
+            docSnap = null;
+        }
+
+        if (docSnap && docSnap.exists) {
 
             userData = {
                 uid: user.uid,
                 ...docSnap.data()
             };
 
-        } else {
+        } else if (docSnap && !docSnap.exists) {
 
             // Create initial user doc if missing
             userData = {
@@ -1539,76 +1556,90 @@ async function loadUserData(user) {
                 createdAt: firebase.firestore.FieldValue.serverTimestamp()
             };
 
-            await docRef.set(userData);
+            // Fire-and-forget — don't block the UI
+            docRef.set(userData).catch(e => console.warn("[QuizMaster] Could not write initial user doc:", e));
 
+        } else {
+            // Timed out — use a minimal local fallback so the app still loads
+            userData = {
+                uid: user.uid,
+                name: user.displayName || user.email.split("@")[0],
+                email: user.email,
+                currentStreak: 0,
+                bestStreak: 0,
+                totalQuizzes: 0,
+                averageScore: 0
+            };
         }
 
         currentStreak = userData.currentStreak || 0;
-        bestStreak = userData.bestStreak || 0;
+        bestStreak    = userData.bestStreak    || 0;
 
-        // Fetch user quiz history from Firestore
-        try {
+        // ─── Update UI immediately so the app is visible ──────────────────────
+        document.getElementById("studentName").textContent = userData.name || "Student";
+        document.getElementById("navUser").textContent     = userData.name || "Student";
+        document.getElementById("loginPage").classList.add("hidden");
+        document.getElementById("app").classList.remove("hidden");
+        showPage("dashboard");
 
-            const historySnap = await db.collection("quizHistory")
-                .where("userId", "==", user.uid)
-                .get();
+        // ─── Fetch quiz history with timeout — non-blocking ───────────────────
+        (async () => {
+            try {
 
-            quizHistory = [];
+                const historySnap = await withTimeout(
+                    db.collection("quizHistory")
+                        .where("userId", "==", user.uid)
+                        .get(),
+                    6000
+                );
 
-            historySnap.forEach(doc => {
+                quizHistory = [];
 
-                quizHistory.push({
-                    id: doc.id,
-                    ...doc.data()
+                historySnap.forEach(doc => {
+                    quizHistory.push({
+                        id: doc.id,
+                        ...doc.data()
+                    });
                 });
 
-            });
+                // Sort chronologically so displayHistory reverse() shows latest first
+                quizHistory.sort((a, b) => {
 
-            // Sort chronologically so displayHistory reverse() shows latest first
-            quizHistory.sort((a, b) => {
+                    const tA =
+                        a.timestamp && a.timestamp.toMillis
+                            ? a.timestamp.toMillis()
+                            : (a.date ? new Date(a.date).getTime() : 0);
 
-                const tA =
-                    a.timestamp && a.timestamp.toMillis
-                        ? a.timestamp.toMillis()
-                        : (a.date ? new Date(a.date).getTime() : 0);
+                    const tB =
+                        b.timestamp && b.timestamp.toMillis
+                            ? b.timestamp.toMillis()
+                            : (b.date ? new Date(b.date).getTime() : 0);
 
-                const tB =
-                    b.timestamp && b.timestamp.toMillis
-                        ? b.timestamp.toMillis()
-                        : (b.date ? new Date(b.date).getTime() : 0);
+                    return tA - tB;
 
-                return tA - tB;
+                });
 
-            });
+                console.log("[QuizMaster] Quiz history loaded:", quizHistory.length, "entries.");
 
-        } catch (histErr) {
+            } catch (histErr) {
 
-            console.warn("Could not fetch quiz history from Firestore:", histErr);
+                if (histErr.message === "timeout") {
+                    console.warn("[QuizMaster] Quiz history fetch timed out — history will be empty until next load.");
+                    showToast("⚠️ History sync slow — quiz history may take a moment to appear.");
+                } else {
+                    console.warn("[QuizMaster] Could not fetch quiz history from Firestore:", histErr);
+                }
 
-            quizHistory = [];
+                quizHistory = [];
 
-        }
-
-        // Update UI
-        document.getElementById("studentName")
-            .textContent = userData.name || "Student";
-
-        document.getElementById("navUser")
-            .textContent = userData.name || "Student";
-
-        document.getElementById("loginPage")
-            .classList.add("hidden");
-
-        document.getElementById("app")
-            .classList.remove("hidden");
-
-        showPage("dashboard");
+            }
+        })();
 
     } catch (err) {
 
-        console.error("Error loading user profile from Firestore:", err);
+        console.error("[QuizMaster] Error loading user profile from Firestore:", err);
 
-        showToast("⚠️ Could not load profile from cloud");
+        showToast("⚠️ Could not load profile from cloud. Please check your connection.");
 
     }
 
@@ -2039,53 +2070,77 @@ async function finishQuiz() {
 
     quizHistory.push(result);
 
-    // Save result to Firestore
-    if (currentUser && typeof db !== "undefined") {
+    // ─── Show result IMMEDIATELY — never block on Firestore ───────────────────
+    showResult(result);
 
-        try {
+    // ─── Firestore sync runs in the background ────────────────────────────────
+    if (currentUser && typeof db !== "undefined" && db) {
 
-            await db.collection("quizHistory").add(result);
+        const SAVE_TIMEOUT_MS = 7000;
 
-            const totalQuizzes = quizHistory.length;
-
-            const totalScore =
-                quizHistory.reduce(
-                    (sum, quiz) => sum + (quiz.score || 0),
-                    0
-                );
-
-            const averageScore =
-                totalQuizzes > 0
-                    ? Math.round(totalScore / totalQuizzes)
-                    : 0;
-
-            await db.collection("users").doc(currentUser.uid).update({
-                currentStreak: currentStreak,
-                bestStreak: bestStreak,
-                totalQuizzes: totalQuizzes,
-                averageScore: averageScore
-            });
-
-            if (userData) {
-
-                userData.currentStreak = currentStreak;
-                userData.bestStreak = bestStreak;
-                userData.totalQuizzes = totalQuizzes;
-                userData.averageScore = averageScore;
-
-            }
-
-        } catch (saveErr) {
-
-            console.error("Error saving quiz result to Firestore:", saveErr);
-
-            showToast("⚠️ Could not sync quiz result to cloud");
-
+        function withTimeout(promise, ms) {
+            return Promise.race([
+                promise,
+                new Promise((_, reject) =>
+                    setTimeout(() => reject(new Error("timeout")), ms)
+                )
+            ]);
         }
 
-    }
+        (async () => {
+            try {
 
-    showResult(result);
+                await withTimeout(
+                    db.collection("quizHistory").add(result),
+                    SAVE_TIMEOUT_MS
+                );
+
+                const totalQuizzes = quizHistory.length;
+
+                const totalScore =
+                    quizHistory.reduce(
+                        (sum, quiz) => sum + (quiz.score || 0),
+                        0
+                    );
+
+                const averageScore =
+                    totalQuizzes > 0
+                        ? Math.round(totalScore / totalQuizzes)
+                        : 0;
+
+                await withTimeout(
+                    db.collection("users").doc(currentUser.uid).update({
+                        currentStreak: currentStreak,
+                        bestStreak:    bestStreak,
+                        totalQuizzes:  totalQuizzes,
+                        averageScore:  averageScore
+                    }),
+                    SAVE_TIMEOUT_MS
+                );
+
+                if (userData) {
+                    userData.currentStreak = currentStreak;
+                    userData.bestStreak    = bestStreak;
+                    userData.totalQuizzes  = totalQuizzes;
+                    userData.averageScore  = averageScore;
+                }
+
+                console.log("[QuizMaster] Quiz result saved to Firestore successfully.");
+
+            } catch (saveErr) {
+
+                console.error("[QuizMaster] Background Firestore save failed:", saveErr);
+
+                showToast(
+                    saveErr.message === "timeout"
+                        ? "⚠️ Result shown locally — cloud sync timed out. Check your connection."
+                        : "⚠️ Result shown locally, but cloud sync failed. Check your connection."
+                );
+
+            }
+        })();
+
+    }
 
 }
 
@@ -3831,33 +3886,25 @@ function setupTeacherWaitingRoomUI(comp) {
 }
 
 function getLiveCompetitionJoinUrl(code) {
-    const defaultPagesBase = "https://iniya75.github.io/QuizManagement/";
-    let baseUrl = defaultPagesBase;
+    let baseUrl = "";
 
     try {
-        if (typeof window !== "undefined" && window.location) {
-            const host = window.location.hostname;
-            if (host === "iniya75.github.io") {
-                let pathname = window.location.pathname;
-                if (!pathname.endsWith("/")) {
-                    const lastSlash = pathname.lastIndexOf("/");
-                    pathname = lastSlash >= 0 ? pathname.substring(0, lastSlash + 1) : "/";
-                }
-                baseUrl = `${window.location.origin}${pathname}`;
-            } else if (host === "localhost" || host === "127.0.0.1" || window.location.protocol === "file:") {
-                // When running locally, use public GitHub Pages URL so scanning on phones works!
-                baseUrl = defaultPagesBase;
-            } else {
-                let pathname = window.location.pathname;
-                if (!pathname.endsWith("/")) {
-                    const lastSlash = pathname.lastIndexOf("/");
-                    pathname = lastSlash >= 0 ? pathname.substring(0, lastSlash + 1) : "/";
-                }
-                baseUrl = `${window.location.origin}${pathname}`;
+        if (typeof window !== "undefined" && window.location && window.location.origin) {
+            let pathname = window.location.pathname || "/";
+            // Strip filename (e.g. index.html) — keep only directory portion
+            if (!pathname.endsWith("/")) {
+                const lastSlash = pathname.lastIndexOf("/");
+                pathname = lastSlash >= 0 ? pathname.substring(0, lastSlash + 1) : "/";
             }
+            baseUrl = window.location.origin + pathname;
         }
     } catch (e) {
-        baseUrl = defaultPagesBase;
+        baseUrl = "";
+    }
+
+    // Safety fallback — should never happen in a real browser
+    if (!baseUrl) {
+        baseUrl = "https://shanjayask.github.io/Quiz-Management/";
     }
 
     if (!baseUrl.endsWith("/")) {
@@ -3865,7 +3912,7 @@ function getLiveCompetitionJoinUrl(code) {
     }
 
     const fullJoinUrl = `${baseUrl}?join=${encodeURIComponent(code)}`;
-    console.log("[SKQ Host] Generated public QR join URL:", fullJoinUrl);
+    console.log("[SKQ Host] Generated QR join URL:", fullJoinUrl);
     return fullJoinUrl;
 }
 
@@ -3875,6 +3922,17 @@ function renderHostQrCode(code) {
     qrContainer.innerHTML = "";
 
     const joinUrl = getLiveCompetitionJoinUrl(code);
+
+    // Show a local-dev notice so the teacher knows the QR is for same-network use
+    const isLocal = typeof window !== "undefined" &&
+        window.location &&
+        (window.location.hostname === "localhost" ||
+         window.location.hostname === "127.0.0.1" ||
+         window.location.protocol === "file:");
+
+    if (isLocal) {
+        showToast("📡 QR URL uses localhost — only scannable on the same device/network. On a deployed site the QR will work for everyone.");
+    }
 
     try {
         if (typeof QRCode !== "undefined") {
@@ -3887,11 +3945,12 @@ function renderHostQrCode(code) {
                 correctLevel: QRCode.CorrectLevel.M
             });
         } else {
-            // Fallback SVG QR generator or QR Server API
+            // Fallback: QR Server API (online only)
             qrContainer.innerHTML = `<img src="https://api.qrserver.com/v1/create-qr-code/?size=170x170&data=${encodeURIComponent(joinUrl)}" alt="QR Code" style="width:170px;height:170px;border-radius:12px;" />`;
+            console.warn("[SKQ] QRCode.js library not loaded — using fallback QR API image.");
         }
     } catch (qrErr) {
-        console.warn("QR generation fallback:", qrErr);
+        console.warn("[SKQ] QR generation error, using API fallback:", qrErr);
         qrContainer.innerHTML = `<img src="https://api.qrserver.com/v1/create-qr-code/?size=170x170&data=${encodeURIComponent(joinUrl)}" alt="QR Code" style="width:170px;height:170px;border-radius:12px;" />`;
     }
 }
@@ -5075,7 +5134,7 @@ function normalizeCompetitionCode(rawCode) {
 }
 
 function ensureStudentCompetitionProjectMatches() {
-    const expectedProjectId = "quizquest-3d82a";
+    const expectedProjectId = "shanjayaquizmanagement";
     const actualProjectId = getFirebaseProjectId();
     if (actualProjectId && actualProjectId !== expectedProjectId) {
         throw liveError("CONFIG", `This live quiz page is connected to Firebase project "${actualProjectId}", but the active competition data is in "${expectedProjectId}". Refresh or redeploy the student site to the correct Firebase project.`);
